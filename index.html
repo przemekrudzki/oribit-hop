@@ -440,12 +440,14 @@ function loop(now) {
 
 function start() {
   $('start').classList.add('hidden'); $('over').classList.add('hidden');
+  if (document.activeElement instanceof HTMLButtonElement) document.activeElement.blur();
   reset(); $('pause').textContent = 'Pause'; $('pause').disabled = false; $('paused').classList.add('hidden'); running = true; beep(660, 0.12, 'triangle', 0.1, 220);
 }
 
 function setPaused(value) {
   if (!running) return;
   paused = value;
+  if (!paused && document.activeElement instanceof HTMLButtonElement) document.activeElement.blur();
   $('paused').classList.toggle('hidden', !paused);
   $('pause').textContent = paused ? 'Resume' : 'Pause';
   if (paused && actx) actx.suspend();
@@ -472,10 +474,10 @@ $('play').addEventListener('click', e => { e.stopPropagation(); start(); });
 $('again').addEventListener('click', e => { e.stopPropagation(); start(); });
 cv.addEventListener('pointerdown', e => { e.preventDefault(); launch(); });
 addEventListener('keydown', e => {
-  if (e.repeat || e.target.tagName === 'BUTTON') return;
+  if (e.repeat) return;
   if (e.code === 'KeyP' || e.code === 'Escape') { e.preventDefault(); setPaused(!paused); return; }
   if (e.code === 'KeyM') { $('mute').click(); return; }
-  if (paused) return;
+  if (paused || e.target.tagName === 'BUTTON') return;
   if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'Enter') {
     e.preventDefault();
     if (running) launch();
