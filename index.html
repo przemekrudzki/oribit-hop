@@ -29,6 +29,9 @@
     background:rgba(124,247,255,.08); color:var(--accent); cursor:pointer;
     box-shadow:0 0 24px rgba(124,247,255,.25); }
   button:hover { background:rgba(124,247,255,.18); }
+  #controls { position:fixed; top:64px; right:16px; display:flex; gap:8px; z-index:3; }
+  #controls button { padding:8px 12px; font-size:13px; margin:0; }
+  button:focus-visible { outline:3px solid #fff; outline-offset:4px; }
   #hint { position:fixed; bottom:28px; left:16px; right:16px; text-align:center;
     color:var(--fg); font-size:15px; pointer-events:none; text-shadow:0 2px 8px #000; }
   #hint:empty { display:none; }
@@ -40,11 +43,14 @@
 <div id="hint" role="status" aria-live="polite"></div>
 <div id="hud"><div id="score">0</div><div id="best">BEST 0</div></div>
 
+<div id="controls"><button id="pause" disabled>Pause</button><button id="mute" aria-pressed="false">Mute</button></div>
+<div id="paused" class="overlay hidden"><h1>PAUSED</h1><p>Take your time. Resume when you’re ready.</p><button id="resume">RESUME</button></div>
 <div id="start" class="overlay">
   <h1>ORBIT HOP</h1>
   <p>You are a tiny moon. Tap, click or press <kbd>Space</kbd> to break orbit and fly off on a tangent.
      Get caught by the next planet's orbit ring.</p>
   <p>Your first orbit is safe while you learn. After that, orbits decay—watch the countdown ring. Grab the <span style="color:#ffd76a">✦</span> stars on the way.</p>
+  <p>Chain quick hops for bonuses. Stars collected in flight are worth double. <kbd>P</kbd> pauses; <kbd>M</kbd> mutes.</p>
   <button id="play">PLAY</button>
 </div>
 
@@ -72,8 +78,10 @@ const rand = (a, b) => a + Math.random() * (b - a);
 const TAU = Math.PI * 2;
 
 // ---------- audio ----------
-let actx = null;
+let actx = null, muted = false;
+try { muted = localStorage.getItem('orbitHopMuted') === 'true'; } catch (e) {}
 function beep(freq, dur = 0.12, type = 'sine', vol = 0.15, slide = 0) {
+  if (muted || paused || document.hidden) return;
   try {
     actx = actx || new (window.AudioContext || window.webkitAudioContext)();
     const o = actx.createOscillator(), g = actx.createGain(), t = actx.currentTime;
@@ -95,11 +103,11 @@ const bgStars = Array.from({ length: 180 }, () => ({
 }));
 
 // ---------- game state ----------
-let planets, gems, particles, trail, player, camY, score, running, t, shake, lastPlanetY, flash, firstJump, lastHint;
+let planets, gems, particles, trail, player, camY, score, running, t, shake, lastPlanetY, flash, firstJump, lastHint, labels, orbitSince, combo, routeIndex, paused = false;
 
 function column() { const cw = Math.min(W, 560); return { l: (W - cw) / 2, w: cw }; }
 
-function makePlanet(y, first = false, previous = null) {
+function makePlanet(y, first = false, previous = null, route = 'wide') {
   const lvl = score || 0;
   const { l, w } = column();
   const radius = first ? 30 : Math.max(12, rand(18, 34) - lvl * 0.4);
@@ -109,7 +117,7 @@ function makePlanet(y, first = false, previous = null) {
   let bx = W / 2;
   if (!first && !(firstJump && previous && previous.visited)) {
     if (previous) {
-      const reach = Math.min(230, (maxX - minX) * 0.85);
+      const reach = Math.min(route === 'recovery' ? 90 : 230, (maxX - minX) * 0.85);
       const leftRoom = previous.bx - minX, rightRoom = maxX - previous.bx;
       const direction = leftRoom < reach * 0.35 ? 1 : rightRoom < reach * 0.35 ? -1 : Math.random() < 0.5 ? -1 : 1;
       const room = direction > 0 ? rightRoom : leftRoom;
@@ -120,11 +128,11 @@ function makePlanet(y, first = false, previous = null) {
   const hue = Math.floor(rand(0, 360));
   return {
     x: bx, bx, y, radius,
-    orbitR: radius + rand(40, 54),
+    orbitR: Math.max(radius + 24, Math.min(radius + rand(40, 54), H * 0.18)),
     hue, ring: Math.random() < 0.35,
     amp: moving ? Math.max(0, Math.min(rand(20, 45), bx - minX, maxX - bx)) : 0,
     spd: rand(0.6, 1.3) + lvl * 0.02, ph: rand(0, TAU),
-    visited: first, pulse: 0
+    visited: first, starter: first, pulse: 0
   };
 }
 
@@ -132,30 +140,35 @@ function spawnAhead() {
   while (lastPlanetY > camY - H * 0.6) {
     const prev = planets[planets.length - 1];
     const tutorialTarget = firstJump && prev.visited;
+    const route = routeIndex++ % 5 === 3 ? 'recovery' : Math.random() < 0.25 ? 'detour' : 'wide';
     // Scale spacing to the screen so the next orbit remains visible on short displays.
     const gap = tutorialTarget ? Math.min(180, H * 0.42)
+      : route === 'recovery' ? rand(Math.min(185, H * 0.34), Math.min(225, H * 0.42))
       : rand(Math.min(250, H * 0.42), Math.min(330 + Math.min(40, (score || 0) * 2), H * 0.55));
     lastPlanetY -= gap;
-    const p = makePlanet(lastPlanetY, false, prev);
+    const p = makePlanet(lastPlanetY, false, prev, route);
+    // Avoid overlapping capture rings, especially in landscape layouts.
+    p.y = Math.min(p.y, prev.y - prev.orbitR - p.orbitR - 28);
+    lastPlanetY = p.y;
     planets.push(p);
-    if (Math.random() < 0.55) {
-      gems.push({
-        x: (prev.bx + p.bx) / 2 + rand(-40, 40),
-        y: (prev.y + p.y) / 2 + rand(-20, 20),
-        got: false, ph: rand(0, TAU)
-      });
+    const starCount = route === 'detour' ? 3 : Math.random() < 0.55 ? 1 : 0;
+    for (let i = 0; i < starCount; i++) {
+      const f = starCount === 1 ? 0.5 : 0.35 + i * 0.15;
+      gems.push({ x: prev.bx + (p.bx - prev.bx) * f + (route === 'detour' ? 28 : rand(-25, 25)),
+        y: prev.y + (p.y - prev.y) * f, got:false, ph:rand(0, TAU) });
     }
   }
 }
 
 function reset() {
+  labels = []; combo = 0; orbitSince = 0; routeIndex = 0; paused = false;
   firstJump = true; lastHint = ''; $('hint').textContent = '';
   score = 0; t = 0; shake = 0; flash = 0;
   planets = []; gems = []; particles = []; trail = [];
   const p0 = makePlanet(0, true);
   planets.push(p0); lastPlanetY = 0;
   camY = -H * 0.72;
-  player = { x: 0, y: 0, vx: 0, vy: 0, state: 'orbit', planet: p0, from: null, ang: -Math.PI / 2, r: p0.orbitR, dir: 1 };
+  player = { x: p0.x, y: p0.y - p0.orbitR, vx: 0, vy: 0, state: 'orbit', planet: p0, from: null, ang: -Math.PI / 2, r: p0.orbitR, dir: 1 };
   spawnAhead();
   $('score').textContent = '0';
 }
@@ -172,7 +185,7 @@ function burst(x, y, hue, n = 20, sp = 200) {
 }
 
 function launch() {
-  if (!running || player.state !== 'orbit') return;
+  if (!running || paused || player.state !== 'orbit') return;
   const p = player.planet;
   const tx = -Math.sin(player.ang) * player.dir, ty = Math.cos(player.ang) * player.dir;
   player.vx = tx * LAUNCH; player.vy = ty * LAUNCH;
@@ -183,6 +196,7 @@ function launch() {
 }
 
 function gameOver(reason) {
+  $('pause').disabled = true;
   running = false; shake = 14; $('hint').textContent = '';
   burst(player.x, player.y, 0, 50, 320);
   beep(180, 0.5, 'sawtooth', 0.12, -140);
@@ -195,6 +209,7 @@ function gameOver(reason) {
 }
 
 function update(dt) {
+  if (paused) return;
   t += dt;
   for (const p of planets) {
     if (p.amp) p.x = p.bx + Math.sin(t * p.spd + p.ph) * p.amp;
@@ -214,17 +229,25 @@ function update(dt) {
       for (const p of planets) {
         if (p === player.from) continue;
         const dx = player.x - p.x, dy = player.y - p.y, d = Math.hypot(dx, dy);
-        if (d < p.orbitR) {
+        // A narrow assisted zone rescues inward-moving near misses.
+        const inward = dx * player.vx + dy * player.vy < 0;
+        if (d < p.orbitR || (d < p.orbitR + 12 && inward)) {
+          const assisted = d >= p.orbitR;
           player.state = 'orbit'; player.planet = p;
           player.ang = Math.atan2(dy, dx);
-          player.r = Math.max(d, p.radius + 14);
+          player.r = Math.min(p.orbitR, Math.max(d, p.radius + 14));
           player.dir = (dx * player.vy - dy * player.vx) >= 0 ? 1 : -1;
           p.pulse = 1;
           if (!p.visited) {
-            p.visited = true; score++;
-            $('score').textContent = score;
+            const quick = t - orbitSince < 1.6 && !p.visited && player.from.visited && !player.from.starter;
+            combo = quick ? combo + 1 : 0;
+            p.visited = true;
+            const bonus = Math.min(combo, 3);
+            award(1 + bonus, player.x, player.y, bonus ? 'Quick hop +' + (1 + bonus) : '+1');
             beep(440 + Math.min(score, 30) * 22, 0.18, 'sine', 0.16, 200);
           } else beep(300, 0.1, 'sine', 0.08);
+          orbitSince = t;
+          if (assisted) labels.push({x:p.x, y:p.y - p.orbitR, text:'Orbit catch!', life:1.2});
           burst(player.x, player.y, p.hue, 14, 140);
           break;
         }
@@ -243,8 +266,9 @@ function update(dt) {
     // gems
     for (const g of gems) {
       if (!g.got && Math.hypot(player.x - g.x, player.y - g.y) < 20) {
-        g.got = true; score++; flash = 1;
-        $('score').textContent = score;
+        g.got = true; flash = 1;
+        const points = player.state === 'fly' ? 2 : 1;
+        award(points, g.x, g.y, points === 2 ? 'Flight star +2' : 'Star +1');
         beep(988, 0.08, 'square', 0.06); setTimeout(() => beep(1318, 0.12, 'square', 0.06), 70);
         burst(g.x, g.y, 45, 16, 160);
       }
@@ -253,8 +277,14 @@ function update(dt) {
     if (trail.length > 26) trail.shift();
   }
 
-  // camera follows the planet you're orbiting
-  const target = (player.state === 'orbit' ? player.planet.y : Math.min(player.y, player.from.y)) - H * 0.68;
+  // Frame the current orbit and its destination before the launch.
+  const next = planets.find(p => p.y < player.planet.y && !p.visited);
+  let target = player.planet.y - H * 0.72;
+  if (player.state === 'orbit' && next) {
+    target = Math.min(target, next.y - next.orbitR - H * 0.15);
+  } else if (player.state === 'fly') {
+    target = Math.min(player.y - H * 0.52, player.from.y - H * 0.72);
+  }
   camY += (target - camY) * Math.min(1, dt * 3);
   spawnAhead();
   planets = planets.filter(p => p.y - camY < H + 200 || p === player.planet);
@@ -262,10 +292,17 @@ function update(dt) {
 
   for (const q of particles) { q.x += q.vx * dt; q.y += q.vy * dt; q.vx *= 0.96; q.vy *= 0.96; q.life -= dt; }
   particles = particles.filter(q => q.life > 0);
+  for (const label of labels) { label.y -= dt * 25; label.life -= dt; }
+  labels = labels.filter(label => label.life > 0);
   shake *= 0.9; flash = Math.max(0, flash - dt * 3);
 }
 
 // Match the flight capture rule and account for a target's motion along the preview.
+function award(points, x, y, text) {
+  score += points; $('score').textContent = score;
+  labels.push({x, y, text, life:1.4});
+}
+
 function predictLaunch() {
   const tx = -Math.sin(player.ang) * player.dir, ty = Math.cos(player.ang) * player.dir;
   const limit = Math.min(520, H * 0.85);
@@ -275,7 +312,8 @@ function predictLaunch() {
     for (const p of planets) {
       if (p === player.planet) continue;
       const futureX = p.amp ? p.bx + Math.sin((t + time) * p.spd + p.ph) * p.amp : p.x;
-      if (Math.hypot(x - futureX, y - p.y) < p.orbitR) return { planet:p, distance, tx, ty };
+      const dx = x - futureX, dy = y - p.y, d = Math.hypot(dx, dy);
+      if (d < p.orbitR || (d < p.orbitR + 12 && dx * tx + dy * ty < 0)) return { planet:p, distance, tx, ty };
     }
     if (x < 0 || x > W || y - camY < 0 || y - camY > H) return { planet:null, distance, tx, ty };
   }
@@ -387,6 +425,8 @@ function draw() {
     ctx.fillStyle = q.hue === 0 ? '#ff6b7a' : `hsl(${q.hue},95%,70%)`;
     ctx.fillRect(q.x - q.size / 2, q.y - camY - q.size / 2, q.size, q.size);
   }
+  ctx.font = 'bold 15px system-ui'; ctx.textAlign = 'center'; ctx.fillStyle = '#ffd76a';
+  for (const label of labels) { ctx.globalAlpha = Math.min(1, label.life); ctx.fillText(label.text, label.x, label.y - camY); }
   ctx.globalAlpha = 1;
   ctx.restore();
 }
@@ -400,14 +440,42 @@ function loop(now) {
 
 function start() {
   $('start').classList.add('hidden'); $('over').classList.add('hidden');
-  reset(); running = true; beep(660, 0.12, 'triangle', 0.1, 220);
+  reset(); $('pause').textContent = 'Pause'; $('pause').disabled = false; $('paused').classList.add('hidden'); running = true; beep(660, 0.12, 'triangle', 0.1, 220);
 }
+
+function setPaused(value) {
+  if (!running) return;
+  paused = value;
+  $('paused').classList.toggle('hidden', !paused);
+  $('pause').textContent = paused ? 'Resume' : 'Pause';
+  if (paused && actx) actx.suspend();
+  else if (actx && !muted) actx.resume();
+}
+function syncMute() {
+  $('mute').textContent = muted ? 'Unmute' : 'Mute';
+  $('mute').setAttribute('aria-pressed', String(muted));
+}
+$('pause').addEventListener('click', () => setPaused(!paused));
+$('resume').addEventListener('click', () => setPaused(false));
+$('mute').addEventListener('click', () => {
+  muted = !muted; syncMute();
+  try { localStorage.setItem('orbitHopMuted', String(muted)); } catch (e) {}
+  if (muted && actx) actx.suspend();
+  else if (!paused && actx) actx.resume();
+});
+document.addEventListener('visibilitychange', () => { if (document.hidden) setPaused(true); });
+addEventListener('blur', () => setPaused(true));
+syncMute();
 
 // ---------- input ----------
 $('play').addEventListener('click', e => { e.stopPropagation(); start(); });
 $('again').addEventListener('click', e => { e.stopPropagation(); start(); });
 cv.addEventListener('pointerdown', e => { e.preventDefault(); launch(); });
 addEventListener('keydown', e => {
+  if (e.repeat || e.target.tagName === 'BUTTON') return;
+  if (e.code === 'KeyP' || e.code === 'Escape') { e.preventDefault(); setPaused(!paused); return; }
+  if (e.code === 'KeyM') { $('mute').click(); return; }
+  if (paused) return;
   if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'Enter') {
     e.preventDefault();
     if (running) launch();
